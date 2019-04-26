@@ -2,8 +2,11 @@ package main.java;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadLocalRandom;
@@ -11,6 +14,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+
+import static java.util.Comparator.comparingInt;
+import static java.util.stream.Collectors.collectingAndThen;
+import static java.util.stream.Collectors.toCollection;
 
 public class SearchEngineProblem {
     static class DocumentWithRelevance {
@@ -22,11 +29,11 @@ public class SearchEngineProblem {
             this.relevance = relevance;
         }
 
-        public String getDocumentId() {
+        String getDocumentId() {
             return documentId;
         }
 
-        public int getRelevance() {
+        int getRelevance() {
             return relevance;
         }
 
@@ -48,6 +55,9 @@ public class SearchEngineProblem {
         }
     }
 
+    ////////////////////////////////////////////////////////////////////////////////
+    // TODO: This is the interface you should use.
+    ////////////////////////////////////////////////////////////////////////////////
     interface Backend {
         // Returns total number of shards.
         int getShardCount();
@@ -65,42 +75,72 @@ public class SearchEngineProblem {
         //
         // See https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ScheduledExecutorService.html
         ScheduledExecutorService getScheduler();
-
     }
+    ////////////////////////////////////////////////////////////////////////////////
 
     ////////////////////////////////////////////////////////////////////////////////
     // TODO: This is the class you should implement.
     ////////////////////////////////////////////////////////////////////////////////
     static class SearchEngine {
         private final Backend backend;
+        private Random r;
 
         SearchEngine(Backend backend) {
             this.backend = backend;
+            r = new Random();
+        }
+
+        private CompletableFuture<List<DocumentWithRelevance>> getSearch(Object query, int shard) {
+            int firstRep = r.nextInt(backend.getReplicaCount(shard));
+            int secondRep = firstRep;
+            while (secondRep == firstRep) {
+                secondRep = r.nextInt(backend.getReplicaCount(shard));
+            }
+            int secondRepp = secondRep;
+            CompletableFuture<List<DocumentWithRelevance>> myCompletableFuture = new CompletableFuture<>();
+            CompletableFuture<List<DocumentWithRelevance>> firstTry = backend.search(query, shard, firstRep);
+            firstTry.thenAccept(myCompletableFuture::complete);
+            backend.getScheduler().schedule(() -> {
+                if (!firstTry.isDone() && backend.getReplicaCount(shard) > 1) {
+                    CompletableFuture<List<DocumentWithRelevance>> secondTry = backend.search(query, shard, secondRepp);
+                    secondTry.thenAccept(myCompletableFuture::complete);
+                }
+            }, 2, TimeUnit.MILLISECONDS);
+            return myCompletableFuture;
+        }
+
+        private List<DocumentWithRelevance> prettyResults(List<DocumentWithRelevance> allCombo, int limit) {
+            List<DocumentWithRelevance> queriesResults = allCombo.stream()
+                    .collect(collectingAndThen(toCollection(() ->
+                                    new TreeSet<>((o1, o2) -> {
+                                        if (o1.getDocumentId().equals(o2.getDocumentId())) return 0;
+                                        return o1.getDocumentId().compareTo(o2.getDocumentId());
+                                    })),
+                            ArrayList::new));
+            queriesResults.sort(comparingInt(DocumentWithRelevance::getRelevance).reversed());
+            return queriesResults.subList(0, limit);
         }
 
         // Return a list of top K documents sorted by relevance (descending).
         // Returned documents must be unique.
-        CompletableFuture<List<DocumentWithRelevance>> search(Object query, int limit) throws ExecutionException, InterruptedException {
+        CompletableFuture<List<DocumentWithRelevance>> search(Object query, int limit) {
             List<CompletableFuture<List<DocumentWithRelevance>>> futures = new ArrayList<>();
             // Get results from all replicas
             for (int shard = 0; shard < backend.getShardCount(); shard++) {
-                for (int replica = 0; replica < backend.getReplicaCount(shard); replica++) {
-                    CompletableFuture<List<DocumentWithRelevance>> result = backend.search(query, shard, replica);
-                    futures.add(result);
-                }
+                CompletableFuture<List<DocumentWithRelevance>> result = getSearch(query, shard);
+                futures.add(result);
             }
             CompletableFuture<Void> allFutures =
                     CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
 
-            CompletableFuture<List<List<DocumentWithRelevance>>> allCombo =
+            CompletableFuture<List<DocumentWithRelevance>> allCombo =
                     allFutures.thenApply(future ->
-                            futures.stream().map(CompletableFuture::join).collect(Collectors.toList())
+                            futures.stream()
+                                    .map(CompletableFuture::join)
+                                    .flatMap(List::stream)
+                                    .collect(Collectors.toList())
                     );
-
-            List<DocumentWithRelevance> queriesResults = new ArrayList<>();
-            queriesResults.addAll(allCombo.get().stream().flatMap(List::stream).collect(Collectors.toList()));
-            queriesResults.sort(Comparator.comparingInt(DocumentWithRelevance::getRelevance).reversed());
-            return CompletableFuture.completedFuture(queriesResults.subList(0, limit));
+            return allCombo.thenApply(x -> prettyResults(x, limit));
         }
     }
     ////////////////////////////////////////////////////////////////////////////////
@@ -123,7 +163,8 @@ public class SearchEngineProblem {
         }
         Arrays.sort(arrivalTimesMs);
 
-        FakeBackend backend = new FakeBackend(mu, 5, 3);
+        ExecutorService tank = Executors.newSingleThreadExecutor(new UniqueNamedThreadFactory("TANK"));
+        FakeBackend backend = new FakeBackend(4.0, mu, 5, 3, 1);
         SearchEngine engine = new SearchEngine(backend);
 
         long[] requestTimesNs = new long[requestCount];
@@ -132,27 +173,36 @@ public class SearchEngineProblem {
             final int finalRequestIndex = requestIndex;
             Thread.sleep(arrivalTimesMs[requestIndex] - (requestIndex > 0 ? arrivalTimesMs[requestIndex - 1] : 0));
             String query = String.format("query-%d", ThreadLocalRandom.current().nextInt(0, Integer.MAX_VALUE));
-            long startedAt = System.nanoTime();
-            logDebug("Searching for '%s' (request %d)...", query, finalRequestIndex);
-            futures.add(finalRequestIndex, engine.search(query, k).whenComplete((strings, throwable) -> {
-                if (throwable != null) {
-                    logInfo("Request %d for query '%s' has failed: %s", finalRequestIndex, query, throwable.toString());
-                } else {
-                    long completedAt = System.nanoTime();
-                    requestTimesNs[finalRequestIndex] = completedAt - startedAt;
-                }
-            }));
+            Future<CompletableFuture<List<DocumentWithRelevance>>> future = tank.submit(() -> {
+                long startedAt = System.nanoTime();
+                logDebug("Searching for '%s' (request %d)...", query, finalRequestIndex);
+                return engine.search(query, k).whenCompleteAsync((strings, throwable) -> {
+                    if (throwable != null) {
+                        logInfo("Search for query '%s' (request %d) has failed: %s",
+                                query, finalRequestIndex, throwable.toString());
+                    } else {
+                        long completedAt = System.nanoTime();
+                        logInfo("Search for query '%s' (request %d) has completed in %dms",
+                                query, finalRequestIndex, (completedAt - startedAt) / 1_000_000);
+                        requestTimesNs[finalRequestIndex] = completedAt - startedAt;
+                    }
+                }, tank);
+            });
+            futures.add(finalRequestIndex, future.get());
         }
         logInfo("Waiting for all requests to complete...");
         futures.forEach(CompletableFuture::join);
         logInfo("All requests are completed.");
+        tank.shutdown();
+
         boolean ok = true;
         for (int requestIndex = 0; requestIndex < requestCount; ++requestIndex) {
+            boolean thisOk = true;
             List<DocumentWithRelevance> documents = futures.get(requestIndex).get();
             if (documents.size() != k) {
                 logInfo("WRONG: Request %d has returned %d documents, while expecting %d documents!",
                         requestIndex, documents.size(), k);
-                ok = false;
+                thisOk = false;
             }
             for (int documentIndex = 1; documentIndex < documents.size(); ++documentIndex) {
                 DocumentWithRelevance current = documents.get(documentIndex);
@@ -160,11 +210,21 @@ public class SearchEngineProblem {
                 if (current.getRelevance() > previous.getRelevance()) {
                     logInfo("WRONG: Request %d has returned documents %d and %d in the wrong order!",
                             requestIndex, documentIndex - 1, documentIndex);
+                    thisOk = false;
+                }
+            }
+            int uniqueDocuments = documents.stream().map(DocumentWithRelevance::getDocumentId).collect(Collectors.toSet()).size();
+            int totalDocuments = documents.size();
+            if (totalDocuments != uniqueDocuments) {
+                logInfo("WRONG: Request %d has duplicate documents!", requestIndex);
+                thisOk = false;
+            }
+            ok = ok & thisOk;
+            if (!thisOk) {
+                for (int documentIndex = 0; documentIndex < documents.size(); ++documentIndex) {
+                    DocumentWithRelevance document = documents.get(documentIndex);
                     logInfo("WRONG:     D[%d] = { DocumentId: '%s', Relevance: %d }",
-                            documentIndex - 1, previous.getDocumentId(), previous.getRelevance());
-                    logInfo("WRONG:     D[%d] = { DocumentId: '%s', Relevance: %d }",
-                            documentIndex, current.getDocumentId(), current.getRelevance());
-                    ok = false;
+                            documentIndex, document.getDocumentId(), document.getRelevance());
                 }
             }
         }
@@ -185,7 +245,7 @@ public class SearchEngineProblem {
         int q90Index = 90 * requestCount / 100;
         int q99Index = 99 * requestCount / 100;
         for (int i = 0; i < requestCount; ++i) {
-            double t = (double) requestTimesNs[i] / 1_000_000_000.0;
+            double t = (double) requestTimesNs[i] / 1_000_000.0;
             if (i == 0) {
                 min = t;
             }
@@ -206,8 +266,8 @@ public class SearchEngineProblem {
         }
         double mean = sum / (double) requestCount;
         double stddev = Math.sqrt(sumSq / (double) requestCount - mean * mean);
-        logInfo("MIN: %8.3fs | MAX: %8.3fs | MEAN: %8.3fs +- %8.3fs", min, max, mean, stddev);
-        logInfo("Q50: %8.3fs | Q90: %8.3fs |  Q99: %8.3fs", q50, q90, q99);
+        logInfo("MIN: %8.3fms | MAX: %8.3fms | MEAN: %8.3fms +- %8.3fms", min, max, mean, stddev);
+        logInfo("Q50: %8.3fms | Q90: %8.3fms |  Q99: %8.3fms", q50, q90, q99);
 
         backend.shutdown();
     }
@@ -219,25 +279,102 @@ public class SearchEngineProblem {
     ////////////////////////////////////////////////////////////////////////////////
 
     static class FakeBackend implements Backend {
+        static class FakeServer {
+            static class Task {
+                final CompletableFuture<List<DocumentWithRelevance>> future = new CompletableFuture<>();
+                final Object query;
+                final long serviceTimeMs;
+
+                Task(Object query, long serviceTimeMs) {
+                    this.query = query;
+                    this.serviceTimeMs = serviceTimeMs;
+                }
+            }
+
+            private final int shard;
+            private final int replica;
+            private final ScheduledExecutorService service;
+            private final Queue<Task> queue;
+            private final AtomicInteger semaphore;
+
+            FakeServer(int shard, int replica, int concurrency) {
+                this.shard = shard;
+                this.replica = replica;
+                this.service = Executors.newSingleThreadScheduledExecutor(
+                        new UniqueNamedThreadFactory(String.format("SRV-Shard%d-Replica%d", shard, replica))
+                );
+                this.service.execute(() -> {
+                });
+                this.queue = new ConcurrentLinkedQueue<>();
+                this.semaphore = new AtomicInteger(concurrency);
+            }
+
+            CompletableFuture<List<DocumentWithRelevance>> search(Object query, long serviceTimeMs) {
+                Task task = new Task(query, serviceTimeMs);
+                queue.add(task);
+                service.execute(this::drain);
+                return task.future;
+            }
+
+            List<DocumentWithRelevance> searchImpl(Object query) {
+                List<DocumentWithRelevance> result = new ArrayList<>(10);
+                for (int i = 0; i < 3; ++i) {
+                    result.add(new DocumentWithRelevance(
+                            String.format("common-doc-%d", i),
+                            ThreadLocalRandom.current().nextInt(100)));
+                }
+                for (int i = 0; i < 7; ++i) {
+                    result.add(new DocumentWithRelevance(
+                            String.format("shard-%d-replica-%d-doc-%d", shard, replica, i),
+                            ThreadLocalRandom.current().nextInt(100)));
+                }
+                return result;
+            }
+
+            void drain() {
+                if (semaphore.decrementAndGet() < 0) {
+                    semaphore.incrementAndGet();
+                    return; // No slots.
+                }
+                Task task = queue.poll();
+                if (task == null) {
+                    semaphore.incrementAndGet();
+                    return; // No tasks.
+                }
+                service.schedule(() -> {
+                    try {
+                        task.future.complete(searchImpl(task.query));
+                    } catch (Throwable ex) {
+                        task.future.completeExceptionally(ex);
+                    } finally {
+                        semaphore.incrementAndGet();
+                        service.execute(this::drain);
+                    }
+                }, task.serviceTimeMs, TimeUnit.MILLISECONDS);
+            }
+
+            void shutdown() {
+                service.shutdown();
+            }
+        }
+
+        private final double alpha;
         private final double mu;
         private final int shardCount;
         private final int replicasPerShard;
         private final ScheduledExecutorService scheduler;
-        private final ScheduledExecutorService[][] services;
+        private final FakeServer[][] servers;
 
-        FakeBackend(double mu, int shardCount, int replicasPerShard) {
+        private FakeBackend(double alpha, double mu, int shardCount, int replicasPerShard, int concurrency) {
+            this.alpha = alpha;
             this.mu = mu;
             this.shardCount = shardCount;
             this.replicasPerShard = replicasPerShard;
             this.scheduler = Executors.newSingleThreadScheduledExecutor(new UniqueNamedThreadFactory("SCHEDULER"));
-            this.services = new ScheduledExecutorService[shardCount][replicasPerShard];
+            this.servers = new FakeServer[shardCount][replicasPerShard];
             for (int shardIndex = 0; shardIndex < shardCount; ++shardIndex) {
                 for (int replicaIndex = 0; replicaIndex < replicasPerShard; ++replicaIndex) {
-                    services[shardIndex][replicaIndex] = Executors.newSingleThreadScheduledExecutor(
-                            new UniqueNamedThreadFactory(String.format("BASE-Shard%d-Replica%d", shardIndex, replicaIndex))
-                    );
-                    services[shardIndex][replicaIndex].submit(() -> {
-                    }); // Warmup.
+                    servers[shardIndex][replicaIndex] = new FakeServer(shardIndex, replicaIndex, concurrency);
                 }
             }
         }
@@ -246,7 +383,7 @@ public class SearchEngineProblem {
             scheduler.shutdown();
             for (int shardIndex = 0; shardIndex < shardCount; ++shardIndex) {
                 for (int replicaIndex = 0; replicaIndex < replicasPerShard; ++replicaIndex) {
-                    services[shardIndex][replicaIndex].shutdown();
+                    servers[shardIndex][replicaIndex].shutdown();
                 }
             }
         }
@@ -285,36 +422,13 @@ public class SearchEngineProblem {
                 future.completeExceptionally(new RuntimeException("Replica index is out of range"));
                 return future;
             }
-            CompletableFuture<List<DocumentWithRelevance>> future = new CompletableFuture<>();
             long serviceTimeMs;
             if (ThreadLocalRandom.current().nextDouble() < 0.05) {
-                serviceTimeMs = (long) pareto(4.0, 1.0 / mu);
+                serviceTimeMs = (long) pareto(alpha, 1.0 / mu);
             } else {
                 serviceTimeMs = (long) exp(-1.0 / mu);
             }
-            services[shard][replica].schedule(() -> {
-                try {
-                    future.complete(queryImpl(query, shard, replica));
-                } catch (Throwable ex) {
-                    future.completeExceptionally(ex);
-                }
-            }, serviceTimeMs, TimeUnit.MILLISECONDS);
-            return future;
-        }
-
-        List<DocumentWithRelevance> queryImpl(Object query, int shard, int replica) {
-            List<DocumentWithRelevance> result = new ArrayList<>(10);
-            for (int i = 0; i < 3; ++i) {
-                result.add(new DocumentWithRelevance(
-                        String.format("common-doc-%d", i),
-                        ThreadLocalRandom.current().nextInt(100)));
-            }
-            for (int i = 0; i < 7; ++i) {
-                result.add(new DocumentWithRelevance(
-                        String.format("shard-%d-replica-%d-doc-%d", shard, replica, i),
-                        ThreadLocalRandom.current().nextInt(100)));
-            }
-            return result;
+            return servers[shard][replica].search(query, serviceTimeMs);
         }
 
         @Override
@@ -324,7 +438,6 @@ public class SearchEngineProblem {
     }
 
     // Threading.
-
     static class UniqueNamedThreadFactory implements ThreadFactory {
         private final String name;
 
